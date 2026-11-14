@@ -1,0 +1,1 @@
+Cricsheet T20 JSON ingestion is the first adapter. See docs/PHASE_1_5_HISTORICAL_INGESTION.md for usage and schema limitations. The importer writes local JSONL plus a manifest; PostgreSQL loading is opt-in with --load-db.
