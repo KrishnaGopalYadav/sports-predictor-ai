@@ -113,6 +113,10 @@ def persist_match(db: Session, item: dict[str, Any]) -> bool:
         player_ids[name] = player.id
     team_ids = {name: get_or_create_team(db, name).id for name in item["teams"]}
     match_time = datetime.fromisoformat(item["scheduled_at"])
+    # The table's natural key is (sport, player, team, valid_from), not
+    # source_match_id. Deduplicate both within this match (autoflush is off)
+    # and against affiliations committed by earlier matches on the same date.
+    seen_affiliations: set[tuple[int, int]] = set()
     for team_name, names in (item.get("player_rosters") or {}).items():
         team_id = team_ids.get(team_name)
         if team_id is None:
@@ -121,12 +125,15 @@ def persist_match(db: Session, item: dict[str, Any]) -> bool:
             player_id = player_ids.get(player_name)
             if player_id is None:
                 continue
+            affiliation_key = (player_id, team_id)
+            if affiliation_key in seen_affiliations:
+                continue
+            seen_affiliations.add(affiliation_key)
             exists = db.scalar(select(PlayerTeamAffiliation).where(
                 PlayerTeamAffiliation.sport == "cricket",
                 PlayerTeamAffiliation.player_id == player_id,
                 PlayerTeamAffiliation.team_id == team_id,
-                PlayerTeamAffiliation.source_provider == "cricsheet",
-                PlayerTeamAffiliation.source_match_id == provider_id))
+                PlayerTeamAffiliation.valid_from == match_time))
             if exists is None:
                 db.add(PlayerTeamAffiliation(sport="cricket", player_id=player_id,
                     team_id=team_id, valid_from=match_time, source_provider="cricsheet",
