@@ -1,0 +1,157 @@
+"""Cricsheet T20 JSON ZIP ingestion; raw archive members are never extracted."""
+from __future__ import annotations
+import argparse, json, logging, shutil, urllib.request, zipfile
+from datetime import date, datetime, time, timezone
+from pathlib import Path
+from typing import Any, Iterator
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+from app.database import SessionLocal
+from app.models import Competition, Match, MatchEvent, MatchStatus, Player, Sport, Team, Venue
+
+LOG = logging.getLogger("sports_predictor.ingestion.cricsheet")
+DEFAULT_URL = "https://cricsheet.org/downloads/t20s_json.zip"
+
+def read_json_members(archive_path: Path) -> Iterator[tuple[str, dict[str, Any]]]:
+    with zipfile.ZipFile(archive_path) as archive:
+        for member in archive.infolist():
+            if member.is_dir() or not member.filename.lower().endswith(".json"):
+                continue
+            try:
+                payload = json.loads(archive.read(member).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                LOG.warning("Skipping invalid JSON member %s: %s", member.filename, exc)
+                continue
+            if isinstance(payload, dict):
+                yield Path(member.filename).name, payload
+
+def normalize_match(filename: str, payload: dict[str, Any]) -> dict[str, Any]:
+    info = payload.get("info") or {}
+    teams, dates = info.get("teams") or [], info.get("dates") or []
+    if len(teams) != 2 or not dates:
+        raise ValueError(f"{filename}: expected two teams and a match date")
+    match_date = date.fromisoformat(str(dates[0]))
+    event, outcome = info.get("event") or {}, info.get("outcome") or {}
+    deliveries = []
+    for innings_no, innings in enumerate(payload.get("innings") or [], start=1):
+        for over in innings.get("overs") or []:
+            for ball_no, delivery in enumerate(over.get("deliveries") or [], start=1):
+                deliveries.append({"innings": innings_no, "over": over.get("over"),
+                    "delivery_in_over": ball_no, "batting_team": innings.get("team"), **delivery})
+    rosters = info.get("players") or {}
+    return {
+        "source": "cricsheet", "source_file": filename,
+        "external_id": f"cricsheet:{Path(filename).stem}", "sport": "cricket",
+        "format": str(info.get("match_type") or "T20"),
+        "match_date": match_date.isoformat(),
+        "scheduled_at": datetime.combine(match_date, time.min, tzinfo=timezone.utc).isoformat(),
+        "competition": event.get("name") or "Unknown T20 competition",
+        "season": str(match_date.year), "venue": info.get("venue"),
+        "teams": [str(t) for t in teams], "winner": outcome.get("winner"),
+        "result": outcome, "toss": info.get("toss"), "player_rosters": rosters,
+        "players": sorted({str(p) for names in rosters.values() for p in (names or [])}),
+        "deliveries": deliveries, "delivery_count": len(deliveries), "raw_info": info,
+    }
+
+def validate_match(item: dict[str, Any]) -> list[str]:
+    issues = []
+    if len(item.get("teams", [])) != 2: issues.append("team_count_not_two")
+    if item.get("winner") and item["winner"] not in item.get("teams", []): issues.append("winner_not_in_teams")
+    if item.get("delivery_count", 0) <= 0: issues.append("no_deliveries")
+    if item.get("format", "").upper() != "T20": issues.append("not_t20")
+    return issues
+
+def get_or_create_team(db: Session, name: str) -> Team:
+    team = db.scalar(select(Team).where(Team.sport == Sport.cricket, Team.name == name))
+    if team is None:
+        team = Team(sport=Sport.cricket, name=name); db.add(team); db.flush()
+    return team
+
+def persist_match(db: Session, item: dict[str, Any]) -> bool:
+    if db.scalar(select(Match).where(Match.external_id == item["external_id"])) is not None:
+        return False
+    home, away = (get_or_create_team(db, n) for n in item["teams"])
+    competition = db.scalar(select(Competition).where(
+        Competition.sport == Sport.cricket, Competition.name == item["competition"],
+        Competition.season == item["season"]))
+    if competition is None:
+        competition = Competition(sport=Sport.cricket, name=item["competition"], season=item["season"])
+        db.add(competition); db.flush()
+    venue_id = None
+    if item.get("venue"):
+        venue = db.scalar(select(Venue).where(Venue.sport == Sport.cricket, Venue.name == item["venue"]))
+        if venue is None:
+            venue = Venue(sport=Sport.cricket, name=item["venue"]); db.add(venue); db.flush()
+        venue_id = venue.id
+    match = Match(sport=Sport.cricket, external_id=item["external_id"],
+        competition_id=competition.id, venue_id=venue_id, home_team_id=home.id, away_team_id=away.id,
+        scheduled_at=datetime.fromisoformat(item["scheduled_at"]), status=MatchStatus.completed,
+        result=str(item.get("winner") or json.dumps(item.get("result") or {})),
+        raw_payload=json.dumps({k:v for k,v in item.items() if k not in {"deliveries","player_rosters"}}, default=str))
+    db.add(match); db.flush()
+    for name in item.get("players", []):
+        if db.scalar(select(Player).where(Player.sport == Sport.cricket, Player.name == name)) is None:
+            db.add(Player(sport=Sport.cricket, name=name))
+    for seq, delivery in enumerate(item["deliveries"], start=1):
+        db.add(MatchEvent(match_id=match.id, sequence_no=seq, event_type="delivery",
+                          payload=json.dumps(delivery, separators=(",", ":"), default=str)))
+    return True
+
+def ingest_archive(archive: Path, output: Path, load_db: bool = False) -> dict[str, Any]:
+    output.mkdir(parents=True, exist_ok=True)
+    normalized = output / "matches.jsonl"
+    counts = {"files_seen":0,"matches_normalized":0,"matches_loaded":0,
+              "duplicates_skipped":0,"invalid_matches":0,"deliveries":0}
+    issues: dict[str,int] = {}
+    db = SessionLocal() if load_db else None
+    try:
+        with normalized.open("w", encoding="utf-8") as target:
+            for filename, payload in read_json_members(archive):
+                counts["files_seen"] += 1
+                try: item = normalize_match(filename, payload)
+                except (ValueError, TypeError, KeyError) as exc:
+                    counts["invalid_matches"] += 1; LOG.warning("Skipping %s: %s", filename, exc); continue
+                found = validate_match(item)
+                for issue in found: issues[issue] = issues.get(issue,0) + 1
+                if found: counts["invalid_matches"] += 1; continue
+                target.write(json.dumps(item, separators=(",",":"), default=str) + "\n")
+                counts["matches_normalized"] += 1; counts["deliveries"] += item["delivery_count"]
+                if db is not None:
+                    try:
+                        inserted = persist_match(db, item); db.commit()
+                        counts["matches_loaded" if inserted else "duplicates_skipped"] += 1
+                    except Exception:
+                        db.rollback(); LOG.exception("Database load failed for %s", filename); raise
+    finally:
+        if db is not None: db.close()
+    manifest = {"provider":"Cricsheet","archive":archive.name,
+        "generated_at":datetime.now(timezone.utc).isoformat(),"counts":counts,
+        "validation_issues":issues,"normalized_file":str(normalized),"database_loaded":load_db,
+        "notes":["T20 JSON adapter; deliveries stored as MatchEvent JSON payloads.",
+        "Player historical team affiliations and dedicated innings/batting/bowling aggregates are not represented in the current schema."]}
+    (output / "manifest.json").write_text(json.dumps(manifest,indent=2),encoding="utf-8")
+    return manifest
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Ingest Cricsheet T20 JSON ZIP")
+    parser.add_argument("--source",type=Path,help="Downloaded Cricsheet ZIP")
+    parser.add_argument("--download",action="store_true",help="Download the Cricsheet T20 archive")
+    parser.add_argument("--url",default=DEFAULT_URL)
+    parser.add_argument("--output",type=Path,default=Path("/app/data/processed/cricsheet"))
+    parser.add_argument("--load-db",action="store_true",help="Load normalized records into PostgreSQL")
+    args = parser.parse_args()
+    if bool(args.source) == bool(args.download): parser.error("provide exactly one of --source or --download")
+    if args.download:
+        raw = Path("/app/data/raw/cricsheet"); raw.mkdir(parents=True,exist_ok=True)
+        archive = raw / "t20s_json.zip"
+        request = urllib.request.Request(args.url,headers={"User-Agent":"SportsPredictorAI/0.1 research-ingestion"})
+        with urllib.request.urlopen(request,timeout=120) as response, archive.open("wb") as target:
+            shutil.copyfileobj(response,target)
+    else:
+        archive = args.source.resolve()
+        if not archive.is_file(): parser.error(f"archive not found: {archive}")
+    print(json.dumps(ingest_archive(archive,args.output,args.load_db),indent=2))
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    main()
