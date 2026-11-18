@@ -51,5 +51,5 @@ def list_predictions(match_id: int, db: Session = Depends(get_db)):
 
 @router.post("/evaluation/score")
 def evaluate(payload: EvaluationRequest):
-    result = score_predictions([row.model_dump() for row in payload.rows])
+    result = score_predictions([row.model_dump() for row in payload.rows], sport=payload.sport)
     return {"sport": payload.sport, **result}
