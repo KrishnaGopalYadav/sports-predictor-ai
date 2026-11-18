@@ -1,12 +1,14 @@
-"""Shared scoring metrics for multiclass match-outcome probabilities."""
+"""Shared probability scoring with sport-specific outcome spaces."""
 from math import log
 
 
-def score_predictions(rows: list[dict]) -> dict:
+def score_predictions(rows: list[dict], sport: str = "football") -> dict:
+    if sport not in {"cricket", "football"}:
+        raise ValueError("sport must be cricket or football")
+    labels = ("home", "away") if sport == "cricket" else ("home", "draw", "away")
     if not rows:
         return {"count": 0, "log_loss": None, "brier_score": None}
     log_losses, briers = [], []
-    labels = ("home", "draw", "away")
     for row in rows:
         probs = row["probabilities"]
         actual = row["actual_result"]
@@ -20,4 +22,4 @@ def score_predictions(rows: list[dict]) -> dict:
     if not log_losses:
         return {"count": 0, "log_loss": None, "brier_score": None}
     return {"count": len(log_losses), "log_loss": sum(log_losses) / len(log_losses),
-            "brier_score": sum(briers) / len(briers)}
+            "brier_score": sum(briers) / len(briers), "outcome_classes": len(labels)}
