@@ -5,6 +5,8 @@ from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any, Iterator
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 from app.database import SessionLocal
 from app.models import Competition, Match, MatchEvent, MatchStatus, Player, Sport, Team, Venue
@@ -70,6 +72,39 @@ def get_or_create_team(db: Session, name: str) -> Team:
         team = Team(sport=Sport.cricket, name=name); db.add(team); db.flush()
     return team
 
+
+def insert_player_team_affiliations(db: Session, rows: list[dict[str, Any]]) -> int:
+    """Insert affiliations idempotently using the database's natural unique key.
+
+    Application-side SELECT checks are insufficient here: pending rows are not
+    visible when autoflush is disabled, and concurrent ingestion workers can
+    race between SELECT and INSERT. The database constraint remains authoritative.
+    """
+    if not rows:
+        return 0
+
+    # Collapse duplicates in the current match before issuing a multi-row INSERT.
+    unique_rows: dict[tuple[str, int, int, datetime | None], dict[str, Any]] = {}
+    for row in rows:
+        key = (row["sport"], row["player_id"], row["team_id"], row["valid_from"])
+        unique_rows.setdefault(key, row)
+    values = list(unique_rows.values())
+
+    dialect = db.get_bind().dialect.name
+    if dialect == "postgresql":
+        statement = pg_insert(PlayerTeamAffiliation).values(values).on_conflict_do_nothing(
+            constraint="uq_player_team_period"
+        )
+    elif dialect == "sqlite":
+        statement = sqlite_insert(PlayerTeamAffiliation).values(values).on_conflict_do_nothing(
+            index_elements=["sport", "player_id", "team_id", "valid_from"]
+        )
+    else:
+        raise RuntimeError(f"Idempotent affiliation inserts are not implemented for {dialect}")
+    result = db.execute(statement)
+    return max(result.rowcount or 0, 0)
+
+
 def persist_match(db: Session, item: dict[str, Any]) -> bool:
     provider_id = Path(item["source_file"]).stem
     identity = db.scalar(select(ExternalIdentity).where(
@@ -113,10 +148,7 @@ def persist_match(db: Session, item: dict[str, Any]) -> bool:
         player_ids[name] = player.id
     team_ids = {name: get_or_create_team(db, name).id for name in item["teams"]}
     match_time = datetime.fromisoformat(item["scheduled_at"])
-    # The table's natural key is (sport, player, team, valid_from), not
-    # source_match_id. Deduplicate both within this match (autoflush is off)
-    # and against affiliations committed by earlier matches on the same date.
-    seen_affiliations: set[tuple[int, int]] = set()
+    affiliation_rows = []
     for team_name, names in (item.get("player_rosters") or {}).items():
         team_id = team_ids.get(team_name)
         if team_id is None:
@@ -125,19 +157,12 @@ def persist_match(db: Session, item: dict[str, Any]) -> bool:
             player_id = player_ids.get(player_name)
             if player_id is None:
                 continue
-            affiliation_key = (player_id, team_id)
-            if affiliation_key in seen_affiliations:
-                continue
-            seen_affiliations.add(affiliation_key)
-            exists = db.scalar(select(PlayerTeamAffiliation).where(
-                PlayerTeamAffiliation.sport == "cricket",
-                PlayerTeamAffiliation.player_id == player_id,
-                PlayerTeamAffiliation.team_id == team_id,
-                PlayerTeamAffiliation.valid_from == match_time))
-            if exists is None:
-                db.add(PlayerTeamAffiliation(sport="cricket", player_id=player_id,
-                    team_id=team_id, valid_from=match_time, source_provider="cricsheet",
-                    source_match_id=provider_id))
+            affiliation_rows.append({
+                "sport": "cricket", "player_id": player_id, "team_id": team_id,
+                "valid_from": match_time, "source_provider": "cricsheet",
+                "source_match_id": provider_id,
+            })
+    insert_player_team_affiliations(db, affiliation_rows)
     for innings_data in aggregate_innings({"raw_innings": item.get("raw_innings", [])}):
         batting_team_id = team_ids.get(innings_data["batting_team"])
         if batting_team_id is None:
@@ -191,7 +216,7 @@ def ingest_archive(archive: Path, output: Path, load_db: bool = False) -> dict[s
         "generated_at":datetime.now(timezone.utc).isoformat(),"counts":counts,
         "validation_issues":issues,"normalized_file":str(normalized),"database_loaded":load_db,
         "notes":["T20 JSON adapter; deliveries stored as MatchEvent JSON payloads.",
-        "Player historical team affiliations and dedicated innings/batting/bowling aggregates are not represented in the current schema."]}
+        "Structured innings, batting, bowling, and observed player-team affiliations are persisted when --load-db is enabled."]}
     (output / "manifest.json").write_text(json.dumps(manifest,indent=2),encoding="utf-8")
     return manifest
 
