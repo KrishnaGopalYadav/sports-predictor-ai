@@ -78,7 +78,7 @@ class Match(Base):
     away_team_id: Mapped[int] = mapped_column(ForeignKey("teams.id"), nullable=False)
     scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     status: Mapped[MatchStatus] = mapped_column(SAEnum(MatchStatus), default=MatchStatus.scheduled, index=True)
-    result: Mapped[Optional[str]] = mapped_column(String(50))
+    result: Mapped[Optional[str]] = mapped_column(Text)
     raw_payload: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
 
