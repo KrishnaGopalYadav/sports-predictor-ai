@@ -5,8 +5,10 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .database import Base, engine, get_db
 from . import models  # noqa: F401
+from .sports.registry import build_default_registry
 
 app = FastAPI(title=settings.app_name, version="0.1.0")
+sport_registry = build_default_registry()
 
 
 @app.on_event("startup")
@@ -29,7 +31,10 @@ def root():
 @app.get("/api/v1/meta")
 def meta():
     return {
-        "sports": ["cricket", "football"],
+        "sports": [
+            {"code": sport.code, "name": sport.display_name}
+            for sport in sport_registry.list()
+        ],
         "phase": "R1 foundation",
         "purpose": "private local research and validation",
     }
